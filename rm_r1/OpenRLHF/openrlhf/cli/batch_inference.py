@@ -6,11 +6,17 @@ import jsonlines
 import torch
 from torch import distributed as dist
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
 
 from openrlhf.datasets import PromptDataset, SFTDataset
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.utils import blending_datasets, get_processor, get_strategy, get_tokenizer
+
+
+def _ensure_output_dir(path: str):
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
 
 def batch_generate_vllm(args):
@@ -80,6 +86,8 @@ def batch_generate_vllm(args):
     N = args.best_of_n
     output_dataset = []
 
+    _ensure_output_dir(args.output_path)
+
     outputs = llm.generate(prompts * N, sampling_params)
     for output in outputs:
         prompt = output.prompt
@@ -104,6 +112,27 @@ def batch_generate(args):
 
     # configure tokenizer
     tokenizer = get_tokenizer(args.pretrain, model.model, "left", strategy, use_fast=not args.disable_fast_tokenizer)
+
+    if args.generation_config:
+        generation_config = GenerationConfig.from_pretrained(args.generation_config)
+    else:
+        generation_config = getattr(model.model, "generation_config", None)
+        if generation_config is None:
+            generation_config = GenerationConfig.from_model_config(model.model.config)
+
+    generation_config = generation_config.clone()
+    generation_config.max_new_tokens = args.max_new_tokens
+    generation_config.do_sample = not args.greedy_sampling
+    generation_config.top_p = args.top_p
+    generation_config.temperature = args.temperature
+    generation_config.repetition_penalty = args.repetition_penalty
+    generation_config.early_stopping = False
+    generation_config.num_beams = 1
+    generation_config.use_cache = True
+    if generation_config.pad_token_id is None:
+        generation_config.pad_token_id = tokenizer.pad_token_id
+    if generation_config.eos_token_id is None:
+        generation_config.eos_token_id = tokenizer.eos_token_id
 
     # prepare models
     model = strategy.prepare(model)
@@ -160,19 +189,7 @@ def batch_generate(args):
 
         inputs = tokenize_fn(prompts)
         for _ in range(N):
-            outputs = model.model.generate(
-                **inputs,
-                use_cache=True,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=not args.greedy_sampling,
-                top_p=args.top_p,
-                early_stopping=False,
-                num_beams=1,
-                temperature=args.temperature,
-                repetition_penalty=args.repetition_penalty,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+            outputs = model.model.generate(**inputs, generation_config=generation_config)
             outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             for prompt, output in zip(prompts, outputs):
                 output = output[len(prompt) :]
@@ -180,13 +197,15 @@ def batch_generate(args):
 
         dist.barrier()
 
+    _ensure_output_dir(args.output_path)
+
     with jsonlines.open(args.output_path + str(strategy.get_rank()), mode="w") as writer:
         writer.write_all(output_dataset)
 
-    # wait unitl all processes generate done
+    # wait until all processes generate done
     dist.barrier()
 
-    # concate multiple output files in rank 0
+    # concatenate multiple output files in rank 0
     if strategy.is_rank_0():
         output_dataset = []
         world_size = dist.get_world_size()
@@ -259,14 +278,14 @@ def batch_rm_inference(args):
 
             dist.barrier()
 
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    _ensure_output_dir(args.output_path)
     with jsonlines.open(args.output_path + str(strategy.get_rank()), mode="w") as writer:
         writer.write_all(output_dataset)
 
-    # wait unitl all processes generate done
+    # wait until all processes generate done
     dist.barrier()
 
-    # concate multiple output files in rank 0
+    # concatenate multiple output files in rank 0
     if strategy.is_rank_0():
         output_dataset = []
         world_size = dist.get_world_size()
@@ -329,6 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=1.0, help="top_p for Sampling")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature for Sampling")
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--generation_config", type=str, default=None, help="Path to generation config for inference")
     parser.add_argument("--best_of_n", type=int, default=1, help="Number of responses to generate per prompt")
     parser.add_argument(
         "--post_processor",
